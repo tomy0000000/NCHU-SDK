@@ -1,3 +1,4 @@
+"""SDK for accessing NCHU Portal System"""
 import logging
 import traceback
 from enum import Enum
@@ -9,6 +10,8 @@ from urllib import parse
 import bs4
 import pandas as pd
 import requests
+
+__version__ = "0.2.0"
 
 logger = logging.getLogger(__name__)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
