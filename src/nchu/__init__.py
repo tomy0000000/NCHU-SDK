@@ -4,7 +4,7 @@ from enum import Enum
 from functools import wraps
 from getpass import getpass
 from time import time
-from urllib.parse import urljoin
+from urllib import parse
 
 import bs4
 import pandas as pd
@@ -23,6 +23,7 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.141 Safari/537.36"
 )
 
+PORTAL_BASE = "https://portal.nchu.edu.tw"
 ACAD_BASE = "https://onepiece2-sso.nchu.edu.tw"
 ACAD_MAP = {
     "home": "cofsys/plsql/acad_home",
@@ -46,6 +47,8 @@ ACAD_MAP = {
     "ques_confirm": "cofsys/plsql/Stud_Question_Conf3",
     "ques_final": "cofsys/plsql/Stud_Question_Dml4",
     "ques_ta_list": "cofsys/plsql/ta_ques_stu",
+    "ques_ta_fill": "cofsys/plsql/ta_ques_stu_des",
+    "ques_ta_send": "cofsys/plsql/ta_ques_stu_des_udt",
 }
 
 ERROR_MSG = """
@@ -70,15 +73,17 @@ class FillingPolicy(Enum):
 
 
 def _acad_url(path: str):
-    return urljoin(ACAD_BASE, ACAD_MAP[path])
+    return parse.urljoin(ACAD_BASE, ACAD_MAP[path])
 
 
 def catch_error(func):
     @wraps(func)
-    def decorated_view_function(*args, **kwargs):
+    def decorated_function(*args, **kwargs):
         try:
             return func(*args, **kwargs)
         except Exception as error:
+            if str(error) == "Incorrect password":
+                raise error
             print(
                 ERROR_MSG.format(
                     error=error.__class__.__name__,
@@ -91,7 +96,19 @@ def catch_error(func):
                 f.write(traceback.format_exc())
             logger.info(f"Write traceback to {traceback_file}")
 
-    return decorated_view_function
+    return decorated_function
+
+
+def acad_required(func):
+    @wraps(func)
+    def decorated_function(self, *args, **kwargs):
+        if not any(
+            [parse.urlparse(ACAD_BASE).netloc in c.domain for c in self.session.cookies]
+        ):
+            self.login_acad()
+        return func(self, *args, **kwargs)
+
+    return decorated_function
 
 
 class Student:
@@ -110,36 +127,37 @@ class Student:
 
     @catch_error
     def login_sso(self):
-        url_entry = "https://idp.nchu.edu.tw/nidp/idff/sso"
-        param_entry = {
-            "id": 4,
-            "sid": 2,
-            "option": "credential",
-            "sid": 2,
-            "target": urljoin(ACAD_BASE, ACAD_MAP["home"]),
-        }
+        # Hit Portal to get SSO login location
+        page_portal_entry = self.session.get(PORTAL_BASE)
+        soup_portal_entry = bs4.BeautifulSoup(page_portal_entry.text, features="lxml")
+        url_sso_entry = parse.urljoin(
+            page_portal_entry.url, soup_portal_entry.find("form").attrs["action"]
+        )
+        logger.debug(f"SSO Entry URL: {url_sso_entry}")
 
-        # Main Entry Page
-        page_entry = self.session.post(url_entry, params=param_entry)
-        assert page_entry.status_code == 200
+        # Get SSO login page
+        page_sso_entry = self.session.post(url_sso_entry)
+        assert page_sso_entry.status_code == 200
+        form_sso = bs4.BeautifulSoup(page_sso_entry.text, features="lxml").find("form")
+        url_sso_login = form_sso.attrs["action"]
+        form_login_data = {
+            field["name"]: field["value"]
+            for field in form_sso.select("input[type=hidden]")
+        }
+        logger.debug(f"SSO login URL: {url_sso_login}")
+        logger.debug(f"SSO login data (redacted): {form_login_data}")
+        form_login_data["Ecom_User_ID"] = self.username
+        form_login_data["Ecom_Password"] = self.__password
 
         # Login with URL given in entry page
-        url_login = (
-            bs4.BeautifulSoup(page_entry.text, "lxml").find("form").attrs["action"]
+        page_sso_login = self.session.post(
+            url_sso_login,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=form_login_data,
         )
-        logger.debug(f"SSO login URL: {url_login}")
-        page_login = self.session.post(
-            url_login,
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            data={
-                "Ecom_User_ID": self.username,
-                "Ecom_Password": self.__password,
-                "option": "credential",
-            },
-        )
-        assert page_login.status_code == 200
+        assert page_sso_login.status_code == 200
+        if "Login failed" in page_sso_login.text or "登入失敗" in page_sso_login.text:
+            raise ValueError("Incorrect password")
 
     @catch_error
     def login_acad(self):
@@ -168,6 +186,7 @@ class Student:
         logger.info(f"User <{self.username}> logined to ACAD")
 
     @catch_error
+    @acad_required
     def get_questionnaire(self):
         logger.info("BEGIN: get_questionnaire")
         url_list = _acad_url("ques_list")
@@ -179,7 +198,7 @@ class Student:
         table = bs4.BeautifulSoup(page.text, features="lxml").find_all("table")[2]
         header = ["".join(tag.strings) for tag in table.select("th")]
         links = [
-            urljoin(url_list, row.select_one("td:nth-of-type(10) a")["href"])
+            parse.urljoin(url_list, row.select_one("td:nth-of-type(10) a")["href"])
             for row in table.find_all("tr")
         ]
         logger.debug(f"Parsed links: {links}")
@@ -199,6 +218,7 @@ class Student:
         return results
 
     @catch_error
+    @acad_required
     def fill_questionnaire(self, questionnaire, policy=FillingPolicy.GREAT):
         logger.info("BEGIN: fill_questionnaire")
         policy = FillingPolicy(policy)
@@ -261,4 +281,82 @@ class Student:
         logger.debug("Final page request success")
 
         logger.info("END: fill_questionnaire")
+        return True
+
+    @catch_error
+    @acad_required
+    def get_ta_questionnaire(self):
+        logger.info("BEGIN: get_ta_questionnaire")
+        url_list = _acad_url("ques_ta_list")
+        page = self.session.get(url_list)
+        assert page.status_code == 200
+        assert "學生TA服務意見調查" in page.text
+        logger.debug("List page request success")
+
+        table = bs4.BeautifulSoup(page.text, features="lxml").find_all("table")[2]
+        header = ["".join(tag.strings) for tag in table.select("th")]
+
+        # Parse Results
+        results = []
+        for course in table.find_all("tr"):
+            questionnaire = {}
+            for index, (key, content) in enumerate(zip(header, course.find_all("td"))):
+                if index == 7:
+                    questionnaire[key] = []
+                    questionnaire["完成填答"] = []
+                    for form in content.find_all("form"):
+                        questionnaire[key].append(
+                            {
+                                field["name"]: field["value"]
+                                for field in form.select("input[type=hidden]")
+                            }
+                        )
+                        questionnaire["完成填答"].append(
+                            bool("已填寫" in "".join(form.strings))
+                        )
+                else:
+                    questionnaire[key] = "".join(content.strings).replace("\n", "")
+            results.append(questionnaire)
+
+        logger.info("END: get_ta_questionnaire")
+        return results
+
+    @catch_error
+    @acad_required
+    def fill_ta_questionnaire(self, ta_questionnaire, policy=FillingPolicy.GREAT):
+        logger.info("BEGIN: fill_ta_questionnaire")
+        policy = FillingPolicy(policy)
+        logger.debug(f"policy: {policy}")
+        page_fill = self.session.post(_acad_url("ques_ta_fill"), data=ta_questionnaire)
+        assert page_fill.status_code == 200
+        assert ta_questionnaire["v_ta"] in page_fill.text
+        logger.debug("Fill page request success")
+
+        # Prepare form data
+        form_fill_data = {}
+        form_fill = bs4.BeautifulSoup(page_fill.text, features="lxml").find("form")
+
+        # Collect hidden field
+        hiddens = form_fill.select("input[type=hidden]")
+        for field in hiddens:
+            form_fill_data[field["name"]] = field["value"]
+        logger.debug(f"hiddens: {hiddens}")
+
+        # Fill radios
+        radios = {field["name"]: "" for field in form_fill.select("input[type=radio]")}
+        for field in radios:
+            form_fill_data[field] = policy.value
+        logger.debug(f"hiddens: {hiddens}")
+
+        # Fill texts
+        form_fill_data[form_fill.find("textarea")["name"]] = ""
+
+        logger.debug(f"form_fill_data: {form_fill_data}")
+        url_send = _acad_url("ques_ta_send")
+        page_send = self.session.post(url_send, data=form_fill_data)
+        assert page_send.status_code == 200
+        assert f"{ta_questionnaire['v_ta']}&nbsp;&nbsp;已填寫" in page_send.text
+        logger.debug("Confirm page request success")
+
+        logger.info("END: fill_ta_questionnaire")
         return True
