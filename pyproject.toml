@@ -5,7 +5,7 @@ build-backend = "flit_core.buildapi"
 [tool.flit.metadata]
 module = "nchu"
 author = "Tomy Hsieh"
-author-email = "tomy0000000@gmail.com"
+author-email = "pypi@tomy.me"
 home-page = "https://github.com/tomy0000000/NCHU-SDK"
 requires = [
     "requests >=2.24.0",
